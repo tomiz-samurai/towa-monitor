@@ -1,0 +1,84 @@
+name: 恵比寿 出勤日監視
+
+on:
+  repository_dispatch:
+    types: [run-monitor]
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "テスト通知を送る（状態ファイルは更新しない）"
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/5 * * * *"
+
+# TOWA 監視と同時に main へ push しうるため、このワークフロー自身は直列化する。
+# 相手ワークフローとの衝突は push 前の git pull --rebase とリトライで吸収する。
+concurrency:
+  group: este-4064-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 最新のブランチ先端を取得
+        run: |
+          set -euo pipefail
+          git fetch origin "${GITHUB_REF_NAME}"
+          git checkout -B "${GITHUB_REF_NAME}" "origin/${GITHUB_REF_NAME}"
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 依存パッケージをインストール
+        run: pip install requests
+
+      - name: 監視スクリプトを実行
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+          TEST_NOTIFY: ${{ (github.event_name == 'workflow_dispatch' && inputs.test_notify == true) && 'true' || 'false' }}
+        run: python este_4064_monitor.py
+
+      - name: 状態ファイルをコミット・プッシュ
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_notify != true }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ ! -f este_4064_state.json ]; then
+            echo "状態ファイルがないためコミットをスキップします"
+            exit 0
+          fi
+          git add este_4064_state.json
+          if git diff --staged --quiet; then
+            echo "状態ファイルに変更はありません"
+            exit 0
+          fi
+          git commit -m "chore: update este monitor state [skip ci]"
+          branch="${GITHUB_REF_NAME}"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase "origin" "${branch}" && git push origin "HEAD:${branch}"; then
+              echo "状態ファイルをpushしました"
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            echo "pushに失敗したためリトライします (${i}/5)"
+            sleep $((i * 2))
+          done
+          echo "状態ファイルのpushに失敗しました"
+          exit 1
